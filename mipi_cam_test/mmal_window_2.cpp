@@ -1,0 +1,1629 @@
+#define VCOS_LOG_CATEGORY (&mmalcam_log_category)
+#include "interface/vcos/vcos.h"
+#include "interface/mmal/mmal.h"
+
+extern VCOS_LOG_CAT_T mmalcam_log_category;
+
+typedef enum
+{
+   MMALCAM_CHANGE_NONE,
+   MMALCAM_CHANGE_IMAGE_EFFECT,
+   MMALCAM_CHANGE_ROTATION,
+   MMALCAM_CHANGE_ZOOM,
+   MMALCAM_CHANGE_FOCUS,
+   MMALCAM_CHANGE_DRC,
+   MMALCAM_CHANGE_HDR,
+   MMALCAM_CHANGE_CONTRAST,
+   MMALCAM_CHANGE_BRIGHTNESS,
+   MMALCAM_CHANGE_SATURATION,
+   MMALCAM_CHANGE_SHARPNESS,
+} MMALCAM_CHANGE_T;
+
+typedef enum
+{
+   MMALCAM_INIT_SUCCESS,
+   MMALCAM_INIT_ERROR_EVENT_FLAGS,
+   MMALCAM_INIT_ERROR_VCSM_INIT,
+   MMALCAM_INIT_ERROR_CAMERA,
+   MMALCAM_INIT_ERROR_RENDER,
+   MMALCAM_INIT_ERROR_VIEWFINDER,
+   MMALCAM_INIT_ERROR_ENCODER,
+   MMALCAM_INIT_ERROR_ENCODER_IN,
+   MMALCAM_INIT_ERROR_ENCODER_OUT,
+   MMALCAM_INIT_ERROR_WRITER,
+   MMALCAM_INIT_ERROR_CAMERA_CAPTURE,
+} MMALCAM_INIT_STATUS_T;
+
+typedef struct MMALCAM_BEHAVIOUR_T
+{
+   const char *uri;                             /**< Output URI for recording */
+   const char *vformat;                         /**< Video resolution and encoding format */
+   MMAL_RECT_T display_area;                    /**< Size and position of viewfinder on screen */
+   uint32_t layer;                              /**< Layer number of the viewfinder */
+   MMALCAM_CHANGE_T change;                     /**< Camera change to make, if any */
+   uint32_t seconds_per_change;                 /**< Number of seconds between changes */
+   MMAL_RATIONAL_T frame_rate;                  /**< Frame rate, or zero for variable */
+   MMAL_BOOL_T zero_copy;                       /**< Enable zero copy if set */
+   MMAL_BOOL_T tunneling;                       /**< Enable port tunneling if set */
+   MMAL_BOOL_T opaque;                          /**< Enable opaque image support */
+   VCOS_SEMAPHORE_T init_sem;                   /**< Semaphore signalled once initialisation is complete */
+   MMALCAM_INIT_STATUS_T init_result;           /**< Result of initialisation */
+   MMAL_PARAMETER_STATISTICS_T render_stats;    /**< Video render stats */
+   MMAL_PARAMETER_STATISTICS_T encoder_stats;   /**< Video encoder output stats */
+   uint32_t bit_rate;                           /**< Video encoder bit rate */
+   MMAL_PARAM_FOCUS_T focus_test;               /**< Set to given focus, MMAL_PARAM_FOCUS_MAX to disable */
+   uint32_t camera_num;                         /**< camera number */
+} MMALCAM_BEHAVIOUR_T;
+
+/** Start the camcorder.
+ *
+ * Starts a viewfinder/preview on screen and optionally encodes the camera
+ * output to a URI.
+ *
+ * @param stop When this is set to 1 externally, the camcorder will be stopped.
+ * @param behaviour Defines the behaviour of the camcorder, for automation
+ *    purposes.
+ */
+int test_mmal_start_camcorder(volatile int *stop, MMALCAM_BEHAVIOUR_T *behaviour);
+
+
+/*
+Copyright (c) 2012, Broadcom Europe Ltd
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+    * Neither the name of the copyright holder nor the
+      names of its contributors may be used to endorse or promote products
+      derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+#include <memory.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <stdarg.h>
+
+#include "interface/mmal/mmal.h"
+#include "interface/mmal/mmal_logging.h"
+#include "interface/mmal/util/mmal_util.h"
+#include "interface/mmal/util/mmal_default_components.h"
+
+/** Number of buffers we want to use for video render. Video render needs at least 2. */
+#define VIDEO_OUTPUT_BUFFERS_NUM 3
+
+/** After this many packets, the container (if any) will be closed and we
+ * start discarding encoded packets.
+ */
+#define MAX_PACKET_COUNT 150
+
+/** Initialise a parameter structure */
+#define INIT_PARAMETER(PARAM, PARAM_ID)   \
+   do {                                   \
+      memset(&(PARAM), 0, sizeof(PARAM)); \
+      (PARAM).hdr.id = PARAM_ID;          \
+      (PARAM).hdr.size = sizeof(PARAM);   \
+   } while (0)
+
+/* Utility function to create and setup the camera viewfinder component */
+static MMAL_COMPONENT_T *test_camera_create(MMALCAM_BEHAVIOUR_T *behaviour, MMAL_STATUS_T *status);
+static MMAL_BOOL_T mmalcam_next_effect(MMAL_COMPONENT_T *camera);
+static MMAL_BOOL_T mmalcam_next_rotation(MMAL_COMPONENT_T *camera);
+static MMAL_BOOL_T mmalcam_next_zoom(MMAL_COMPONENT_T *camera);
+static MMAL_BOOL_T mmalcam_next_focus(MMAL_COMPONENT_T *camera);
+static MMAL_BOOL_T mmalcam_reset_focus(MMAL_COMPONENT_T *camera, MMAL_PARAM_FOCUS_T focus_setting);
+static MMAL_BOOL_T mmalcam_next_drc(MMAL_COMPONENT_T *camera);
+static MMAL_BOOL_T mmalcam_next_hdr(MMAL_COMPONENT_T *camera);
+static MMAL_BOOL_T mmalcam_next_colour_param(MMAL_COMPONENT_T *camera, uint32_t id, int min, int max, const char *param_name);
+
+/* Utility function to create and setup the video render component */
+static MMAL_COMPONENT_T *test_video_render_create(MMALCAM_BEHAVIOUR_T *behaviour, MMAL_STATUS_T *status);
+
+/* Utility function to create and setup the video encoder component */
+static MMAL_COMPONENT_T *test_video_encoder_create(MMALCAM_BEHAVIOUR_T *behaviour, MMAL_STATUS_T *status);
+
+/*****************************************************************************/
+
+typedef enum {
+   MMAL_CAM_BUFFER_READY         = 1 << 0,
+   MMAL_CAM_AUTOFOCUS_COMPLETE   = 1 << 1,
+   MMAL_CAM_ANY_EVENT            = 0x7FFFFFFF
+} MMAL_CAM_EVENT_T;
+
+static VCOS_EVENT_FLAGS_T events;
+VCOS_LOG_CAT_T mmalcam_log_category;
+static MMAL_BOOL_T zero_copy;
+static MMAL_BOOL_T tunneling;
+
+static MMAL_BOOL_T enable_zero_copy(void)
+{
+   return zero_copy;
+}
+
+static MMAL_BOOL_T enable_tunneling(void)
+{
+   return tunneling;
+}
+
+/* Buffer header callbacks */
+static void control_bh_cb(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
+{
+   LOG_DEBUG("control_bh_cb %p,%p (cmd=0x%08x)", port, buffer, buffer->cmd);
+   if (buffer->cmd == MMAL_EVENT_PARAMETER_CHANGED)
+   {
+      MMAL_EVENT_PARAMETER_CHANGED_T *param = (MMAL_EVENT_PARAMETER_CHANGED_T *)buffer->data;
+
+      vcos_assert(buffer->length >= sizeof(MMAL_EVENT_PARAMETER_CHANGED_T));
+      vcos_assert(buffer->length == param->hdr.size);
+      switch (param->hdr.id)
+      {
+         case MMAL_PARAMETER_FOCUS_STATUS:
+            vcos_assert(param->hdr.size == sizeof(MMAL_PARAMETER_FOCUS_STATUS_T));
+            {
+               MMAL_PARAMETER_FOCUS_STATUS_T *focus_status = (MMAL_PARAMETER_FOCUS_STATUS_T *)param;
+               LOG_INFO("Focus status: %d", focus_status->status);
+               vcos_event_flags_set(&events, MMAL_CAM_AUTOFOCUS_COMPLETE, VCOS_OR);
+            }
+            break;
+         case MMAL_PARAMETER_CAMERA_NUM:
+            vcos_assert(param->hdr.size == sizeof(MMAL_PARAMETER_UINT32_T));
+            {
+               MMAL_PARAMETER_UINT32_T *camera_num = (MMAL_PARAMETER_UINT32_T *)param;
+               LOG_INFO("Camera number: %d", camera_num->value);
+            }
+            break;
+         default:
+            LOG_ERROR("Unexpected changed event for parameter 0x%08x", param->hdr.id);
+      }
+   }
+   else
+   {
+      LOG_ERROR("Unexpected event, 0x%08x", buffer->cmd);
+   }
+   mmal_buffer_header_release(buffer);
+}
+
+static void generic_output_port_cb(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
+{
+   if (buffer->cmd != 0)
+   {
+      LOG_INFO("%s callback: event %u not supported", port->name, buffer->cmd);
+      mmal_buffer_header_release(buffer);
+   }
+   else
+   {
+      MMAL_QUEUE_T *queue = (MMAL_QUEUE_T *)port->userdata;
+
+      LOG_DEBUG("%s callback", port->name);
+      mmal_queue_put(queue, buffer);
+   }
+
+   vcos_event_flags_set(&events, MMAL_CAM_BUFFER_READY, VCOS_OR);
+}
+
+static void generic_input_port_cb(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buffer)
+{
+   if (buffer->cmd != 0)
+   {
+      LOG_INFO("%s callback: event %u not supported", port->name, buffer->cmd);
+   }
+
+   mmal_buffer_header_release(buffer);
+   vcos_event_flags_set(&events, MMAL_CAM_BUFFER_READY, VCOS_OR);
+}
+
+static MMAL_STATUS_T setup_output_port(MMAL_PORT_T *output_port, MMAL_QUEUE_T **p_queue, MMAL_POOL_T **p_pool)
+{
+   MMAL_STATUS_T status = MMAL_ENOMEM;
+   MMAL_QUEUE_T *queue = NULL;
+   MMAL_POOL_T *pool = NULL;
+
+   /* Create a queue for frames filled by the output port.
+    * The main loop will pass these on to the input port. */
+   queue = mmal_queue_create();
+   if (!queue)
+   {
+      LOG_ERROR("failed to create queue for %s", output_port->name);
+      goto error;
+   }
+
+   /* Create pool of buffer headers for the output port to consume */
+   pool = mmal_port_pool_create(output_port, output_port->buffer_num, output_port->buffer_size);
+   if (!pool)
+   {
+      LOG_ERROR("failed to create pool for %s", output_port->name);
+      goto error;
+   }
+
+   output_port->userdata = (void *)queue;
+
+   status = mmal_port_enable(output_port, generic_output_port_cb);
+   if (status != MMAL_SUCCESS)
+   {
+      LOG_ERROR("failed to enable %s", output_port->name);
+      goto error;
+   }
+
+   *p_queue = queue;
+   *p_pool = pool;
+
+   return MMAL_SUCCESS;
+
+error:
+   if (queue)
+      mmal_queue_destroy(queue);
+   if (pool)
+      mmal_pool_destroy(pool);
+
+   return status;
+}
+
+static MMAL_STATUS_T connect_ports(MMAL_PORT_T *output_port, MMAL_PORT_T *input_port, MMAL_QUEUE_T **p_queue, MMAL_POOL_T **p_pool)
+{
+   MMAL_STATUS_T status;
+
+   status = mmal_format_full_copy(input_port->format, output_port->format);
+   if (status != MMAL_SUCCESS)
+      return status;
+
+   status = mmal_port_format_commit(input_port);
+   if (status != MMAL_SUCCESS)
+      return status;
+
+   if (enable_tunneling())
+   {
+      status = mmal_port_connect(output_port, input_port);
+      if (status != MMAL_SUCCESS)
+         return status;
+
+      status = mmal_port_enable(output_port, NULL);
+      if (status != MMAL_SUCCESS)
+         mmal_port_disconnect(output_port);
+
+      return status;
+   }
+
+   /* Non-tunneling setup */
+   input_port->buffer_size = input_port->buffer_size_recommended;
+   if (input_port->buffer_size < input_port->buffer_size_min)
+      input_port->buffer_size = input_port->buffer_size_min;
+   input_port->buffer_num = input_port->buffer_num_recommended;
+   if (input_port->buffer_num < input_port->buffer_num_min)
+      input_port->buffer_num = input_port->buffer_num_min;
+   output_port->buffer_size = output_port->buffer_size_recommended;
+   if (output_port->buffer_size < output_port->buffer_size_min)
+      output_port->buffer_size = output_port->buffer_size_min;
+   output_port->buffer_num = output_port->buffer_num_recommended;
+   if (output_port->buffer_num < output_port->buffer_num_min)
+      output_port->buffer_num = output_port->buffer_num_min;
+
+   input_port->buffer_num = output_port->buffer_num =
+      MMAL_MAX(input_port->buffer_num, output_port->buffer_num);
+   input_port->buffer_size = output_port->buffer_size =
+      MMAL_MAX(input_port->buffer_size, output_port->buffer_size);
+
+   status = setup_output_port(output_port, p_queue, p_pool);
+   if (status != MMAL_SUCCESS)
+      goto error;
+
+   status = mmal_port_enable(input_port, generic_input_port_cb);
+   if (status != MMAL_SUCCESS)
+      goto error;
+
+   return status;
+
+error:
+   if (input_port->is_enabled)
+      mmal_port_disable(input_port);
+   if (output_port->is_enabled)
+      mmal_port_disable(output_port);
+   if (*p_pool)
+      mmal_pool_destroy(*p_pool);
+   if (*p_queue)
+      mmal_queue_destroy(*p_queue);
+
+   return status;
+}
+
+static MMAL_STATUS_T send_buffer_from_queue(MMAL_PORT_T *port, MMAL_QUEUE_T *queue)
+{
+   MMAL_STATUS_T status = MMAL_SUCCESS;
+   MMAL_BUFFER_HEADER_T *buffer;
+
+   if (!queue)
+      return MMAL_SUCCESS;
+
+   buffer = mmal_queue_get(queue);
+
+   if (buffer)
+   {
+      status = mmal_port_send_buffer(port, buffer);
+
+      if (status != MMAL_SUCCESS)
+      {
+         mmal_queue_put_back(queue, buffer);
+         LOG_DEBUG("%s send failed (%i)", port->name, status);
+      }
+   }
+
+   return status;
+}
+
+static MMAL_STATUS_T fill_port_from_pool(MMAL_PORT_T *port, MMAL_POOL_T *pool)
+{
+   MMAL_STATUS_T status = MMAL_SUCCESS;
+   MMAL_QUEUE_T *queue;
+
+   if (!pool)
+      return MMAL_SUCCESS;
+
+   queue = pool->queue;
+   while (status == MMAL_SUCCESS && mmal_queue_length(queue) > 0)
+      status = send_buffer_from_queue(port, queue);
+
+   return status;
+}
+
+static void disable_port(MMAL_PORT_T *port)
+{
+   if (port && port->is_enabled)
+      mmal_port_disable(port);
+}
+
+
+static int parse_vformat(const char* vformat, uint32_t *out_width,
+      uint32_t *out_height, uint32_t *out_encoding)
+{
+   char vcodec[8];
+   uint32_t width, height, encoding;
+
+   // coverity[secure_coding] Scanning integer values, and a string where the length is safe given vcodec declaration
+   if (sscanf(vformat, "%4ux%4u:%7s", &width, &height, vcodec) != 3)
+   {
+      fprintf(stderr, "Error, malformed or unsupported video format: %s\n", vformat);
+      return -1;
+   }
+
+   if (!vcos_strncasecmp(vcodec, "h263", 4))
+   {
+      encoding = MMAL_ENCODING_H263;
+      /* Special case, H263 supports a limited set of resolutions */
+      if (!((width ==  128 && height ==   96) ||
+            (width ==  176 && height ==  144) ||
+            (width ==  352 && height ==  288) ||
+            (width ==  704 && height ==  576) ||
+            (width == 1408 && height == 1152)))
+      {
+         fprintf(stderr,
+               "Error, only 128x96, 176x144, 352x288, 704x576 and 1408x1152 are supported for H263\n");
+         return -1;
+      }
+   }
+   else if (!vcos_strncasecmp(vcodec, "mp4v", 4))
+      encoding = MMAL_ENCODING_MP4V;
+   else if (!vcos_strncasecmp(vcodec, "h264", 4))
+      encoding = MMAL_ENCODING_H264;
+   else if (!vcos_strncasecmp(vcodec, "jpeg", 4))
+      encoding = MMAL_ENCODING_JPEG;
+   else
+   {
+      fprintf(stderr, "Error, unknown video encoding: %s\n", vcodec);
+      return -1;
+   }
+
+   if (out_width)
+      *out_width = width;
+   if (out_height)
+      *out_height = height;
+   if (out_encoding)
+      *out_encoding = encoding;
+   LOG_DEBUG("Video format: w:%d h:%d codec:%4.4s", width, height, (const char *)&encoding);
+
+   return 0;
+}
+
+/*****************************************************************************/
+int test_mmal_start_camcorder(volatile int *stop, MMALCAM_BEHAVIOUR_T *behaviour)
+{
+   MMAL_STATUS_T status = MMAL_SUCCESS;
+   MMAL_POOL_T *pool_viewfinder = 0, *pool_encoder_in = 0, *pool_encoder_out = 0;
+   MMAL_QUEUE_T *queue_viewfinder = 0, *queue_encoder_in = 0, *queue_encoder_out = 0;
+   MMAL_COMPONENT_T *camera = 0, *encoder = 0, *render = 0;
+   MMAL_PORT_T *viewfinder_port = 0, *video_port = 0, *still_port = 0;
+   MMAL_PORT_T *render_port = 0, *encoder_input = 0, *encoder_output = 0;
+   uint32_t ms_per_change, last_change_ms, set_focus_delay_ms;
+   int packet_count = 0;
+   FILE *output = NULL;
+
+   if(vcos_event_flags_create(&events, "MMALCam") != VCOS_SUCCESS)
+   {
+      behaviour->init_result = MMALCAM_INIT_ERROR_EVENT_FLAGS;
+      goto error;
+   }
+
+   zero_copy = behaviour->zero_copy;
+   tunneling = behaviour->tunneling;
+
+   /* Create and setup camera viewfinder component */
+   camera = test_camera_create(behaviour, &status);
+   if(!camera)
+   {
+      behaviour->init_result = MMALCAM_INIT_ERROR_CAMERA;
+      goto error;
+   }
+   viewfinder_port = camera->output[0];
+   video_port = camera->output[1];
+   still_port = camera->output[2];
+
+   /* Create and setup video render component */
+   render = test_video_render_create(behaviour, &status);
+   if(!render)
+   {
+      behaviour->init_result = MMALCAM_INIT_ERROR_RENDER;
+      goto error;
+   }
+   render_port = render->input[0];
+
+   status = connect_ports(viewfinder_port, render_port, &queue_viewfinder, &pool_viewfinder);
+   if (status != MMAL_SUCCESS)
+   {
+      behaviour->init_result = MMALCAM_INIT_ERROR_VIEWFINDER;
+      goto error;
+   }
+
+   if (behaviour->uri)
+   {
+      MMAL_PARAMETER_BOOLEAN_T camera_capture =
+            {{MMAL_PARAMETER_CAPTURE, sizeof(MMAL_PARAMETER_BOOLEAN_T)}, 1};
+
+      /* Create and setup video encoder component */
+      encoder = test_video_encoder_create(behaviour, &status);
+      if(!encoder)
+      {
+         behaviour->init_result = MMALCAM_INIT_ERROR_ENCODER;
+         goto error;
+      }
+      encoder_input = encoder->input[0];
+      encoder_output = encoder->output[0];
+
+      if (encoder_output->format->encoding == MMAL_ENCODING_JPEG)
+         video_port = still_port;
+
+      status = connect_ports(video_port, encoder_input, &queue_encoder_in, &pool_encoder_in);
+      if (status != MMAL_SUCCESS)
+      {
+         behaviour->init_result = MMALCAM_INIT_ERROR_ENCODER_IN;
+         goto error;
+      }
+
+      status = setup_output_port(encoder_output, &queue_encoder_out, &pool_encoder_out);
+      if (status != MMAL_SUCCESS)
+      {
+         behaviour->init_result = MMALCAM_INIT_ERROR_ENCODER_OUT;
+         goto error;
+      }
+
+      status = mmal_port_parameter_set(video_port, &camera_capture.hdr);
+      if (status != MMAL_SUCCESS && status != MMAL_ENOSYS)
+      {
+         behaviour->init_result = MMALCAM_INIT_ERROR_CAMERA_CAPTURE;
+         goto error;
+      }
+      
+      output = fopen(behaviour->uri, "wb");
+      if(!output)
+      {
+         /* Notify user, carry on discarding encoded output buffers */
+         fprintf(stderr, "Error opening output file: %s\n", behaviour->uri);
+      }
+   }
+
+   /* Initialisation now complete */
+   behaviour->init_result = MMALCAM_INIT_SUCCESS;
+   vcos_semaphore_post(&behaviour->init_sem);
+
+   ms_per_change = behaviour->seconds_per_change * 1000;
+   last_change_ms = vcos_get_ms();
+   set_focus_delay_ms = 1000;
+
+   while(1)
+   {
+      MMAL_BUFFER_HEADER_T *buffer;
+      VCOS_UNSIGNED set;
+
+      vcos_event_flags_get(&events, MMAL_CAM_ANY_EVENT, VCOS_OR_CONSUME, VCOS_TICKS_TO_MS(2), &set);
+      if(*stop) break;
+
+      if (behaviour->focus_test != MMAL_PARAM_FOCUS_MAX)
+      {
+         if (set & MMAL_CAM_AUTOFOCUS_COMPLETE ||
+               (set_focus_delay_ms && (vcos_get_ms() - last_change_ms) >= set_focus_delay_ms))
+         {
+            set_focus_delay_ms = 0;
+            mmalcam_reset_focus(camera, behaviour->focus_test);
+         }
+      }
+
+      /* Send empty buffers to the output ports */
+      status = fill_port_from_pool(viewfinder_port, pool_viewfinder);
+      if (status != MMAL_SUCCESS)
+         break;
+      status = fill_port_from_pool(video_port, pool_encoder_in);
+      if (status != MMAL_SUCCESS)
+         break;
+      status = fill_port_from_pool(encoder_output, pool_encoder_out);
+      if (status != MMAL_SUCCESS)
+         break;
+
+      /* Process filled output buffers */
+      status = send_buffer_from_queue(render_port, queue_viewfinder);
+      if (status != MMAL_SUCCESS)
+         break;
+      status = send_buffer_from_queue(encoder_input, queue_encoder_in);
+      if (status != MMAL_SUCCESS)
+         break;
+
+      /* Process output buffers from encoder */
+      if (queue_encoder_out)
+      {
+         buffer = mmal_queue_get(queue_encoder_out);
+         if (buffer)
+         {
+            if (output)
+            {
+               mmal_buffer_header_mem_lock(buffer);
+               LOG_ERROR("Write %d bytes of data from %p", buffer->length, buffer->data);
+               fwrite(buffer->data, 1, buffer->length, output);
+               mmal_buffer_header_mem_unlock(buffer);
+               packet_count++;
+               if (packet_count > MAX_PACKET_COUNT)
+               {
+                  fclose(output);
+                  output = NULL;
+                  fprintf(stderr, "All packets written\n");
+               }
+            }
+            mmal_buffer_header_release(buffer);
+         }
+      }
+
+      /* Change a camera parameter if requested */
+      if (ms_per_change != 0)
+      {
+         if((vcos_get_ms() - last_change_ms) >= ms_per_change)
+         {
+            last_change_ms = vcos_get_ms();
+            switch (behaviour->change)
+            {
+               case MMALCAM_CHANGE_IMAGE_EFFECT:
+                  if (!mmalcam_next_effect(camera))
+                     *stop = 1;
+                  break;
+               case MMALCAM_CHANGE_ROTATION:
+                  if (!mmalcam_next_rotation(camera))
+                     *stop = 1;
+                  break;
+               case MMALCAM_CHANGE_ZOOM:
+                  if (!mmalcam_next_zoom(camera))
+                     *stop = 1;
+                  break;
+               case MMALCAM_CHANGE_FOCUS:
+                  if (!mmalcam_next_focus(camera))
+                     *stop = 1;
+                  break;
+               case MMALCAM_CHANGE_DRC:
+                  if (!mmalcam_next_drc(camera))
+                     *stop = 1;
+                  break;
+               case MMALCAM_CHANGE_HDR:
+                  if (!mmalcam_next_hdr(camera))
+                     *stop = 1;
+                  break;
+               case MMALCAM_CHANGE_CONTRAST:
+                  if (!mmalcam_next_colour_param(camera, MMAL_PARAMETER_CONTRAST, -100, 100, "contrast"))
+                     *stop = 1;
+                  break;
+               case MMALCAM_CHANGE_BRIGHTNESS:
+                  if (!mmalcam_next_colour_param(camera, MMAL_PARAMETER_BRIGHTNESS, 0, 100, "brightness"))
+                     *stop = 1;
+                  break;
+               case MMALCAM_CHANGE_SATURATION:
+                  if (!mmalcam_next_colour_param(camera, MMAL_PARAMETER_SATURATION, -100, 100, "saturation"))
+                     *stop = 1;
+                  break;
+               case MMALCAM_CHANGE_SHARPNESS:
+                  if (!mmalcam_next_colour_param(camera, MMAL_PARAMETER_SHARPNESS, -100, 100, "sharpness"))
+                     *stop = 1;
+                  break;
+               default:
+                  LOG_ERROR("Unexpected change behaviour: %d", behaviour->change);
+                  break;
+            }
+         }
+      }
+   }
+
+   /* Disable ports */
+   disable_port(viewfinder_port);
+   disable_port(render_port);
+   disable_port(video_port);
+   disable_port(encoder_input);
+   disable_port(encoder_output);
+
+   /* Disable components */
+   mmal_component_disable(render);
+   if (encoder)
+      mmal_component_disable(encoder);
+   mmal_component_disable(camera);
+
+   INIT_PARAMETER(behaviour->render_stats, MMAL_PARAMETER_STATISTICS);
+   mmal_port_parameter_get(render_port, &behaviour->render_stats.hdr);
+   if (encoder)
+   {
+      INIT_PARAMETER(behaviour->encoder_stats, MMAL_PARAMETER_STATISTICS);
+      mmal_port_parameter_get(encoder_output, &behaviour->encoder_stats.hdr);
+   }
+
+ error:
+   /* The pools need to be destroyed first since they are owned by the components */
+   if(pool_viewfinder)
+      mmal_port_pool_destroy(viewfinder_port, pool_viewfinder);
+   if(pool_encoder_in)
+      mmal_port_pool_destroy(video_port, pool_encoder_in);
+   if(pool_encoder_out)
+      mmal_port_pool_destroy(encoder_output, pool_encoder_out);
+
+   if(render)
+      mmal_component_destroy(render);
+   if(encoder)
+      mmal_component_destroy(encoder);
+   if(camera)
+      mmal_component_destroy(camera);
+
+   if(queue_viewfinder)
+      mmal_queue_destroy(queue_viewfinder);
+   if(queue_encoder_in)
+      mmal_queue_destroy(queue_encoder_in);
+   if(queue_encoder_out)
+      mmal_queue_destroy(queue_encoder_out);
+
+   if(output)
+      fclose(output);
+
+   vcos_event_flags_delete(&events);
+
+   if (packet_count)
+      printf("Packet count: %d\n", packet_count);
+
+   if (behaviour->init_result != MMALCAM_INIT_SUCCESS)
+      vcos_semaphore_post(&behaviour->init_sem);
+
+   return (int)status;
+}
+
+/*****************************************************************************/
+static MMAL_COMPONENT_T *test_camera_create(MMALCAM_BEHAVIOUR_T *behaviour, MMAL_STATUS_T *status)
+{
+   MMAL_COMPONENT_T *camera = 0;
+   MMAL_ES_FORMAT_T *format;
+   MMAL_PARAMETER_CHANGE_EVENT_REQUEST_T change_event_request =
+         {{MMAL_PARAMETER_CHANGE_EVENT_REQUEST, sizeof(MMAL_PARAMETER_CHANGE_EVENT_REQUEST_T)}, 0, 1};
+   MMAL_PORT_T *viewfinder_port = NULL, *video_port = NULL, *still_port = NULL;
+   uint32_t width, height;
+   MMAL_PARAMETER_INT32_T camera_num =
+         {{MMAL_PARAMETER_CAMERA_NUM, sizeof(camera_num)},0};
+
+   /* Create the component */
+   *status = mmal_component_create(MMAL_COMPONENT_DEFAULT_CAMERA, &camera);
+   if(*status != MMAL_SUCCESS)
+   {
+      LOG_ERROR("couldn't create camera");
+      goto error;
+   }
+   if(!camera->output_num)
+   {
+      LOG_ERROR("camera doesn't have output ports");
+      *status = MMAL_EINVAL;
+      goto error;
+   }
+
+   viewfinder_port = camera->output[0];
+   video_port = camera->output[1];
+   still_port = camera->output[2];
+
+   change_event_request.change_id = MMAL_PARAMETER_FOCUS_STATUS;
+   *status = mmal_port_parameter_set(camera->control, &change_event_request.hdr);
+   if (*status != MMAL_SUCCESS && *status != MMAL_ENOSYS)
+   {
+      LOG_ERROR("No focus status change events");
+   }
+   camera_num.value = behaviour->camera_num;
+   *status = mmal_port_parameter_set(camera->control, &camera_num.hdr);
+   if (*status != MMAL_SUCCESS && *status != MMAL_ENOSYS)
+   {
+       LOG_ERROR("No camera number change events");
+   }
+   if (enable_zero_copy())
+   {
+      MMAL_PARAMETER_BOOLEAN_T param_zc =
+         {{MMAL_PARAMETER_ZERO_COPY, sizeof(MMAL_PARAMETER_BOOLEAN_T)}, 1};
+      *status = mmal_port_parameter_set(viewfinder_port, &param_zc.hdr);
+      if( *status != MMAL_SUCCESS && *status != MMAL_ENOSYS )
+      {
+         LOG_ERROR("failed to set zero copy on camera output");
+         goto error;
+      }
+      LOG_INFO("enabled zero copy on camera");
+      *status = mmal_port_parameter_set(video_port, &param_zc.hdr);
+      if( *status != MMAL_SUCCESS && *status != MMAL_ENOSYS )
+      {
+         LOG_ERROR("failed to set zero copy on camera output");
+         goto error;
+      }
+      *status = mmal_port_parameter_set(still_port, &param_zc.hdr);
+      if( *status != MMAL_SUCCESS && *status != MMAL_ENOSYS )
+      {
+         LOG_ERROR("failed to set zero copy on camera output");
+         goto error;
+      }
+   }
+
+   if ( behaviour->change == MMALCAM_CHANGE_HDR )
+   {
+      MMAL_PARAMETER_ALGORITHM_CONTROL_T algo_ctrl = {{MMAL_PARAMETER_ALGORITHM_CONTROL, sizeof(MMAL_PARAMETER_ALGORITHM_CONTROL_T)},
+                        MMAL_PARAMETER_ALGORITHM_CONTROL_ALGORITHMS_HIGH_DYNAMIC_RANGE, 1 };
+      mmal_port_parameter_set(camera->control, &algo_ctrl.hdr);
+   }
+
+   *status = mmal_port_enable(camera->control, control_bh_cb);
+   if (*status)
+   {
+      LOG_ERROR("control port couldn't be enabled: %d", *status);
+      goto error;
+   }
+
+   /* Set camera viewfinder port format */
+   if (parse_vformat(behaviour->vformat, &width, &height, NULL))
+   {
+      *status = MMAL_EINVAL;
+      goto error;
+   }
+
+   /* Default to integer frame rate in numerator */
+   if (!behaviour->frame_rate.den)
+      behaviour->frame_rate.den = 1;
+
+   {
+      MMAL_PARAMETER_CAMERA_CONFIG_T cam_config = {{MMAL_PARAMETER_CAMERA_CONFIG,sizeof(cam_config)},
+                              .max_stills_w =      width,
+                              .max_stills_h =      height,
+                              .stills_yuv422 =     0,
+                              .one_shot_stills =   0,
+                              .max_preview_video_w = width,
+                              .max_preview_video_h = height,
+                              .num_preview_video_frames = 3,
+                              .stills_capture_circular_buffer_height = 0,
+                              .fast_preview_resume = 0,
+                                          /* No way of using fast resume in Android, as preview
+                                           * automatically stops on capture.
+                                           */
+                              .use_stc_timestamp = MMAL_PARAM_TIMESTAMP_MODE_RESET_STC
+                              };
+
+      mmal_port_parameter_set(camera->control, &cam_config.hdr);
+   }
+
+   /* Set up the viewfinder port format */
+   format = viewfinder_port->format;
+   if (behaviour->opaque)
+      format->encoding = MMAL_ENCODING_OPAQUE;
+   else
+      format->encoding = MMAL_ENCODING_I420;
+
+   format->es->video.width = width;
+   format->es->video.height = height;
+   format->es->video.crop.x = 0;
+   format->es->video.crop.y = 0;
+   format->es->video.crop.width = width;
+   format->es->video.crop.height = height;
+   format->es->video.frame_rate = behaviour->frame_rate;
+
+   *status = mmal_port_format_commit(viewfinder_port);
+   if(*status)
+   {
+      LOG_ERROR("camera viewfinder format couldn't be set");
+      goto error;
+   }
+
+   /* Set the same format on the video (for encoder) port */
+   mmal_format_full_copy(video_port->format, format);
+   *status = mmal_port_format_commit(video_port);
+   if(*status)
+   {
+      LOG_ERROR("camera video format couldn't be set");
+      goto error;
+   }
+
+   /* Ensure there are enough buffers to avoid dropping frames */
+   if (video_port->buffer_num < VIDEO_OUTPUT_BUFFERS_NUM)
+      video_port->buffer_num = VIDEO_OUTPUT_BUFFERS_NUM;
+
+   /* Set the same format on the still (for encoder) port */
+   mmal_format_full_copy(still_port->format, format);
+   *status = mmal_port_format_commit(still_port);
+   if(*status)
+   {
+      LOG_ERROR("camera still format couldn't be set");
+      goto error;
+   }
+
+   /* Ensure there are enough buffers to avoid dropping frames */
+   if (still_port->buffer_num < VIDEO_OUTPUT_BUFFERS_NUM)
+      still_port->buffer_num = VIDEO_OUTPUT_BUFFERS_NUM;
+
+   /* Enable component */
+   *status = mmal_component_enable(camera);
+   if(*status)
+   {
+      LOG_ERROR("camera component couldn't be enabled");
+      goto error;
+   }
+
+   return camera;
+
+ error:
+   if(camera) mmal_component_destroy(camera);
+   return 0;
+}
+
+/*****************************************************************************/
+static MMAL_BOOL_T mmalcam_next_effect(MMAL_COMPONENT_T *camera)
+{
+   static const MMAL_PARAM_IMAGEFX_T effects[] = {
+               MMAL_PARAM_IMAGEFX_NONE,
+               MMAL_PARAM_IMAGEFX_NEGATIVE,
+               MMAL_PARAM_IMAGEFX_SOLARIZE
+            };
+   static unsigned int index;
+   MMAL_PARAMETER_IMAGEFX_T image_fx = {{ MMAL_PARAMETER_IMAGE_EFFECT, sizeof(image_fx)},0};
+   MMAL_PARAMETER_IMAGEFX_T image_fx_check = {{ MMAL_PARAMETER_IMAGE_EFFECT, sizeof(image_fx)},0};
+   MMAL_STATUS_T result;
+
+   index++;
+   if(index >= countof(effects))
+      index = 0;
+   image_fx.value = effects[index];
+   result = mmal_port_parameter_set(camera->control, &image_fx.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to set image effect, %d", result);
+      return MMAL_FALSE;
+   }
+   result = mmal_port_parameter_get(camera->control, &image_fx_check.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to retrieve image effect, %d", result);
+      return MMAL_FALSE;
+   }
+   if (memcmp(&image_fx, &image_fx_check, sizeof(image_fx)) != 0)
+   {
+      LOG_ERROR("Image effect set (%d) was not retrieved (%d)", image_fx.value, image_fx_check.value);
+      return MMAL_FALSE;
+   }
+   return MMAL_TRUE;
+}
+
+/*****************************************************************************/
+static MMAL_BOOL_T mmalcam_next_rotation(MMAL_COMPONENT_T *camera)
+{
+   static MMAL_PARAMETER_UINT32_T rotate = {{MMAL_PARAMETER_ROTATION,sizeof(rotate)},0};
+   MMAL_PARAMETER_UINT32_T rotate_check = {{MMAL_PARAMETER_ROTATION,sizeof(rotate_check)},0};
+   MMAL_STATUS_T result;
+
+   rotate.value += 90;
+   if(rotate.value == 360)
+      rotate.value = 0;
+   result = mmal_port_parameter_set(camera->output[0], &rotate.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to set rotation, %d", result);
+      return MMAL_FALSE;
+   }
+   result = mmal_port_parameter_get(camera->output[0], &rotate_check.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to retrieve rotation, %d", result);
+      return MMAL_FALSE;
+   }
+   if (memcmp(&rotate, &rotate_check, sizeof(rotate)) != 0)
+   {
+      LOG_ERROR("Rotation set (%d) was not retrieved (%d)", rotate.value, rotate_check.value);
+      return MMAL_FALSE;
+   }
+   return MMAL_TRUE;
+}
+
+/*****************************************************************************/
+static MMAL_BOOL_T mmalcam_next_zoom(MMAL_COMPONENT_T *camera)
+{
+   static MMAL_PARAMETER_SCALEFACTOR_T scale = {{MMAL_PARAMETER_ZOOM,sizeof(scale)},1<<16,1<<16};
+   static int32_t dirn = 1 << 14;
+   MMAL_PARAMETER_SCALEFACTOR_T scale_check = {{MMAL_PARAMETER_ZOOM,sizeof(scale_check)},0,0};
+   MMAL_STATUS_T result;
+
+   scale.scale_x += dirn;
+   scale.scale_y += dirn;
+   if (scale.scale_x >= 4<<16 || scale.scale_x <= 1<<16)
+      dirn = -dirn;
+   result = mmal_port_parameter_set(camera->control, &scale.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to set scale, %d", result);
+      return MMAL_FALSE;
+   }
+   result = mmal_port_parameter_get(camera->control, &scale_check.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to retrieve scale, %d", result);
+      return MMAL_FALSE;
+   }
+   if (memcmp(&scale, &scale_check, sizeof(scale)) != 0)
+   {
+      LOG_ERROR("Scale set (%d,%d) was not retrieved (%d,%d)",
+            scale.scale_x, scale.scale_y, scale_check.scale_x, scale_check.scale_y);
+      return MMAL_FALSE;
+   }
+   return MMAL_TRUE;
+}
+
+/*****************************************************************************/
+static MMAL_BOOL_T mmalcam_next_focus(MMAL_COMPONENT_T *camera)
+{
+   static const MMAL_PARAM_FOCUS_T focus_setting[] = {
+               MMAL_PARAM_FOCUS_AUTO,
+               MMAL_PARAM_FOCUS_AUTO_MACRO,
+               MMAL_PARAM_FOCUS_CAF,
+               MMAL_PARAM_FOCUS_FIXED_INFINITY,
+               MMAL_PARAM_FOCUS_FIXED_HYPERFOCAL,
+               MMAL_PARAM_FOCUS_FIXED_MACRO,
+               MMAL_PARAM_FOCUS_EDOF,
+            };
+   static unsigned int index;
+   static MMAL_PARAMETER_FOCUS_T focus = {{MMAL_PARAMETER_FOCUS,sizeof(focus)},0};
+   static MMAL_PARAMETER_FOCUS_T focus_check = {{MMAL_PARAMETER_FOCUS,sizeof(focus)},0};
+   MMAL_STATUS_T result;
+
+   index++;
+   if(index >= countof(focus_setting))
+      index = MMAL_FALSE;
+   focus.value = focus_setting[index];
+   result = mmal_port_parameter_set(camera->control, &focus.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to set focus to %d", focus.value);
+      /* As this depends on the camera module, do not fail */
+      return MMAL_TRUE;
+   }
+   result = mmal_port_parameter_get(camera->control, &focus_check.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to retrieve focus, %d", result);
+      return MMAL_FALSE;
+   }
+   /* Focus setting is asynchronous, so the value read back may not match what was set */
+   return MMAL_TRUE;
+}
+
+/*****************************************************************************/
+static MMAL_BOOL_T mmalcam_reset_focus(MMAL_COMPONENT_T *camera, MMAL_PARAM_FOCUS_T focus_setting)
+{
+   MMAL_PARAMETER_FOCUS_T focus = {{MMAL_PARAMETER_FOCUS, sizeof(focus)},MMAL_PARAM_FOCUS_FIXED_HYPERFOCAL};
+   MMAL_STATUS_T result;
+
+   result = mmal_port_parameter_set(camera->control, &focus.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to set focus to HYPERFOCAL, result %d", result);
+      return MMAL_FALSE;
+   }
+   focus.value = focus_setting;
+   result = mmal_port_parameter_set(camera->control, &focus.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to set focus to %d, result %d", focus_setting, result);
+      return MMAL_FALSE;
+   }
+   return MMAL_TRUE;
+}
+
+/*****************************************************************************/
+static MMAL_BOOL_T mmalcam_next_drc(MMAL_COMPONENT_T *camera)
+{
+   static const MMAL_PARAMETER_DRC_STRENGTH_T drc_setting[] = {
+               MMAL_PARAMETER_DRC_STRENGTH_OFF,
+               MMAL_PARAMETER_DRC_STRENGTH_LOW,
+               MMAL_PARAMETER_DRC_STRENGTH_MEDIUM,
+               MMAL_PARAMETER_DRC_STRENGTH_HIGH
+            };
+   static unsigned int index;
+   MMAL_STATUS_T result;
+   MMAL_PARAMETER_DRC_T drc = {{MMAL_PARAMETER_DYNAMIC_RANGE_COMPRESSION,sizeof(drc)},0};
+   MMAL_PARAMETER_DRC_T drc_check = {{MMAL_PARAMETER_DYNAMIC_RANGE_COMPRESSION,sizeof(drc_check)},0};
+
+   index++;
+   if(index >= countof(drc_setting))
+      index = 0;
+   drc.strength = drc_setting[index];
+
+   result = mmal_port_parameter_set(camera->control, &drc.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to set drc, %d", result);
+      return MMAL_FALSE;
+   }
+   result = mmal_port_parameter_get(camera->control, &drc_check.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to retrieve drc, %d", result);
+      return MMAL_FALSE;
+   }
+   if (memcmp(&drc, &drc_check, sizeof(drc)) != 0)
+   {
+      LOG_ERROR("DRC set (%d) was not retrieved (%d)", drc.strength, drc_check.strength);
+      return MMAL_FALSE;
+   }
+   return MMAL_TRUE;
+}
+
+/*****************************************************************************/
+static MMAL_BOOL_T mmalcam_next_hdr(MMAL_COMPONENT_T *camera)
+{
+   static const MMAL_BOOL_T hdr_setting[] = {
+               MMAL_FALSE,
+               MMAL_TRUE,
+            };
+   static unsigned int index;
+   MMAL_STATUS_T result;
+   MMAL_PARAMETER_BOOLEAN_T hdr = {{MMAL_PARAMETER_HIGH_DYNAMIC_RANGE,sizeof(hdr)},0};
+   MMAL_PARAMETER_BOOLEAN_T hdr_check = {{MMAL_PARAMETER_HIGH_DYNAMIC_RANGE,sizeof(hdr_check)},0};
+
+   index++;
+   if(index >= countof(hdr_setting))
+      index = 0;
+   hdr.enable = hdr_setting[index];
+
+   result = mmal_port_parameter_set(camera->control, &hdr.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to set hdr, %d", result);
+      return MMAL_FALSE;
+   }
+   result = mmal_port_parameter_get(camera->control, &hdr_check.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to retrieve hdr, %d", result);
+      return MMAL_FALSE;
+   }
+   if (memcmp(&hdr, &hdr_check, sizeof(hdr)) != 0)
+   {
+      LOG_ERROR("HDR set (%d) was not retrieved (%d)", hdr.enable, hdr_check.enable);
+      return MMAL_FALSE;
+   }
+   return MMAL_TRUE;
+}
+
+/*****************************************************************************/
+/* Contrast, brightness, saturation, and sharpness all take the same format,
+ * but need different parameter IDs, and brightness is 0-100, not -100 to 100.
+ */
+static MMAL_BOOL_T mmalcam_next_colour_param(MMAL_COMPONENT_T *camera, uint32_t id, int min, int max, const char *param_name)
+{
+   static MMAL_PARAMETER_RATIONAL_T param = {{MMAL_PARAMETER_GROUP_CAMERA,sizeof(param)},{0,100}};
+   MMAL_PARAMETER_RATIONAL_T param_check = {{MMAL_PARAMETER_GROUP_CAMERA,sizeof(param_check)},{0,100}};
+   MMAL_STATUS_T result;
+   param.hdr.id = id;
+   param_check.hdr.id = id;
+
+   param.value.num += 20;
+   if(param.value.num < min || param.value.num > max)
+      param.value.num = min;
+   result = mmal_port_parameter_set(camera->control, &param.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to set %s, %d", param_name, result);
+      return MMAL_FALSE;
+   }
+   result = mmal_port_parameter_get(camera->control, &param_check.hdr);
+   if (result != MMAL_SUCCESS)
+   {
+      LOG_ERROR("Failed to retrieve %s, %d", param_name, result);
+      return MMAL_FALSE;
+   }
+   if (memcmp(&param, &param_check, sizeof(param)) != 0)
+   {
+      LOG_ERROR("%s set (%d/%d) was not retrieved (%d/%d)", param_name, 
+                  param.value.num, param.value.den, 
+                  param_check.value.num, param_check.value.den);
+      return MMAL_FALSE;
+   }
+   return MMAL_TRUE;
+}
+
+
+/*****************************************************************************/
+static MMAL_COMPONENT_T *test_video_render_create(MMALCAM_BEHAVIOUR_T *behaviour, MMAL_STATUS_T *status)
+{
+   MMAL_COMPONENT_T *render = 0;
+   MMAL_PORT_T *render_port = NULL;
+
+   *status = mmal_component_create(MMAL_COMPONENT_DEFAULT_VIDEO_RENDERER, &render);
+   if(*status != MMAL_SUCCESS)
+   {
+      LOG_ERROR("couldn't create video render");
+      goto error;
+   }
+   if(!render->input_num)
+   {
+      LOG_ERROR("video render doesn't have input ports");
+      *status = MMAL_EINVAL;
+      goto error;
+   }
+
+   render_port = render->input[0];
+
+   /* Give higher priority to the overlay layer */
+   MMAL_DISPLAYREGION_T param;
+   param.hdr.id = MMAL_PARAMETER_DISPLAYREGION;
+   param.hdr.size = sizeof(MMAL_DISPLAYREGION_T);
+   param.set = MMAL_DISPLAY_SET_LAYER;
+   param.layer = behaviour->layer;
+   if (behaviour->display_area.width && behaviour->display_area.height)
+   {
+      param.set |= MMAL_DISPLAY_SET_DEST_RECT | MMAL_DISPLAY_SET_FULLSCREEN;
+      param.fullscreen = 0;
+      param.dest_rect = behaviour->display_area;
+   }
+   *status = mmal_port_parameter_set( render_port, &param.hdr );
+   if (*status != MMAL_SUCCESS && *status != MMAL_ENOSYS)
+   {
+      LOG_ERROR("could not set video render display properties (%u)", *status);
+      goto error;
+   }
+
+   if (enable_zero_copy())
+   {
+      MMAL_PARAMETER_BOOLEAN_T param_zc =
+         {{MMAL_PARAMETER_ZERO_COPY, sizeof(MMAL_PARAMETER_BOOLEAN_T)}, 1};
+      *status = mmal_port_parameter_set(render_port, &param_zc.hdr);
+      if (*status != MMAL_SUCCESS && *status != MMAL_ENOSYS)
+      {
+         LOG_ERROR("failed to set zero copy on render input");
+         goto error;
+      }
+      LOG_INFO("enabled zero copy on render");
+   }
+
+   if (behaviour->opaque)
+   {
+      render_port->format->encoding = MMAL_ENCODING_OPAQUE;
+   }
+
+   /* Enable component */
+   *status = mmal_component_enable(render);
+   if(*status)
+   {
+      LOG_ERROR("video render component couldn't be enabled (%u)", *status);
+      goto error;
+   }
+
+   return render;
+
+ error:
+   if(render) mmal_component_destroy(render);
+   return 0;
+}
+
+/*****************************************************************************/
+static MMAL_COMPONENT_T *test_video_encoder_create(MMALCAM_BEHAVIOUR_T *behaviour, MMAL_STATUS_T *status)
+{
+   MMAL_COMPONENT_T *encoder = 0;
+   MMAL_PORT_T *encoder_input = NULL, *encoder_output = NULL;
+   const char *component_name = MMAL_COMPONENT_DEFAULT_VIDEO_ENCODER;
+   uint32_t encoding;
+
+   /* Set the port format */
+   if (parse_vformat(behaviour->vformat, 0, 0, &encoding))
+   {
+      *status = MMAL_EINVAL;
+      goto error;
+   }
+
+   if (encoding == MMAL_ENCODING_JPEG)
+      component_name = MMAL_COMPONENT_DEFAULT_IMAGE_ENCODER;
+
+   *status = mmal_component_create(component_name, &encoder);
+   if(*status != MMAL_SUCCESS)
+   {
+      LOG_ERROR("couldn't create video encoder");
+      goto error;
+   }
+   if(!encoder->input_num || !encoder->output_num)
+   {
+      LOG_ERROR("video encoder doesn't have input/output ports");
+      *status = MMAL_EINVAL;
+      goto error;
+   }
+
+   encoder_input = encoder->input[0];
+   encoder_output = encoder->output[0];
+
+   mmal_format_copy(encoder_output->format, encoder_input->format);
+   encoder_output->format->encoding = encoding;
+   encoder_output->format->bitrate = behaviour->bit_rate;
+   *status = mmal_port_format_commit(encoder_output);
+   if(*status != MMAL_SUCCESS)
+   {
+      LOG_ERROR("format not set on video encoder output port");
+      goto error;
+   }
+   encoder_output->buffer_size = encoder_output->buffer_size_recommended;
+   if (encoder_output->buffer_size < encoder_output->buffer_size_min)
+      encoder_output->buffer_size = encoder_output->buffer_size_min;
+   encoder_output->buffer_num = encoder_output->buffer_num_recommended;
+   if (encoder_output->buffer_num < encoder_output->buffer_num_min)
+      encoder_output->buffer_num = encoder_output->buffer_num_min;
+
+   if (enable_zero_copy())
+   {
+      MMAL_PARAMETER_BOOLEAN_T param_zc =
+         {{MMAL_PARAMETER_ZERO_COPY, sizeof(MMAL_PARAMETER_BOOLEAN_T)}, 1};
+      *status = mmal_port_parameter_set(encoder_output, &param_zc.hdr);
+      if (*status != MMAL_SUCCESS && *status != MMAL_ENOSYS)
+      {
+         LOG_ERROR("failed to set zero copy on encoder output");
+         goto error;
+      }
+      *status = mmal_port_parameter_set(encoder_input, &param_zc.hdr);
+      if (*status != MMAL_SUCCESS && *status != MMAL_ENOSYS)
+      {
+         LOG_ERROR("failed to set zero copy on encoder input");
+         goto error;
+      }
+      LOG_INFO("enabled zero copy on encoder");
+   }
+
+   if (behaviour->opaque)
+   {
+      encoder_input->format->encoding = MMAL_ENCODING_OPAQUE;
+   }
+
+   /* Enable component */
+   *status = mmal_component_enable(encoder);
+   if(*status)
+   {
+      LOG_ERROR("video encoder component couldn't be enabled");
+      goto error;
+   }
+
+   return encoder;
+
+ error:
+   if(encoder) mmal_component_destroy(encoder);
+   return 0;
+}
+
+
+/*
+Copyright (c) 2012, Broadcom Europe Ltd
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+    * Neither the name of the copyright holder nor the
+      names of its contributors may be used to endorse or promote products
+      derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+*/
+#include <stdlib.h>
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "interface/mmal/mmal_logging.h"
+
+#define VIEWFINDER_LAYER      2
+#define DEFAULT_VIDEO_FORMAT  "1280x720:h264";
+#define DEFAULT_BIT_RATE      5000000
+#define DEFAULT_CAM_NUM       0
+
+struct {
+   const char *name;
+   MMALCAM_CHANGE_T value;
+} mmalcam_change_table[] = {
+   { "image_effect", MMALCAM_CHANGE_IMAGE_EFFECT },
+   { "rotation", MMALCAM_CHANGE_ROTATION },
+   { "zoom", MMALCAM_CHANGE_ZOOM },
+   { "focus", MMALCAM_CHANGE_FOCUS },
+   { "drc", MMALCAM_CHANGE_DRC },
+   { "hdr", MMALCAM_CHANGE_HDR },
+   { "contrast", MMALCAM_CHANGE_CONTRAST },
+   { "brightness", MMALCAM_CHANGE_BRIGHTNESS },
+   { "saturation", MMALCAM_CHANGE_SATURATION },
+   { "sharpness", MMALCAM_CHANGE_SHARPNESS },
+};
+
+static int stop;
+static VCOS_THREAD_T camcorder_thread;
+static MMALCAM_BEHAVIOUR_T camcorder_behaviour;
+static uint32_t sleepy_time;
+static MMAL_BOOL_T stopped_already;
+
+/* Utility functions used by test program */
+static void *test_mmal_camcorder(void *id);
+static void test_signal_handler(int signum);
+static void test_mmalcam_dump_stats(const char *title, MMAL_PARAMETER_STATISTICS_T* stats);
+static int test_parse_cmdline(int argc, const char **argv);
+
+/*****************************************************************************/
+int main(int argc, const char **argv)
+{
+   VCOS_THREAD_ATTR_T attrs;
+   VCOS_STATUS_T status;
+   int result = 0;
+
+   vcos_log_register("mmalcam", VCOS_LOG_CATEGORY);
+   printf("MMAL Camera Test App\n");
+   signal(SIGINT, test_signal_handler);
+
+   camcorder_behaviour.layer = VIEWFINDER_LAYER;
+   camcorder_behaviour.vformat = DEFAULT_VIDEO_FORMAT;
+   camcorder_behaviour.zero_copy = 1;
+   camcorder_behaviour.bit_rate = DEFAULT_BIT_RATE;
+   camcorder_behaviour.focus_test = MMAL_PARAM_FOCUS_MAX;
+   camcorder_behaviour.camera_num = DEFAULT_CAM_NUM;
+
+   if(test_parse_cmdline(argc, argv))
+   {
+      result = -1;
+      goto error;
+   }
+
+   status = vcos_semaphore_create(&camcorder_behaviour.init_sem, "mmalcam-init", 0);
+   vcos_assert(status == VCOS_SUCCESS);
+
+   vcos_thread_attr_init(&attrs);
+   if (vcos_thread_create(&camcorder_thread, "mmal camcorder", &attrs, test_mmal_camcorder, &camcorder_behaviour) != VCOS_SUCCESS)
+   {
+      LOG_ERROR("Thread creation failure");
+      result = -2;
+      goto error;
+   }
+
+   vcos_semaphore_wait(&camcorder_behaviour.init_sem);
+   if (camcorder_behaviour.init_result != MMALCAM_INIT_SUCCESS)
+   {
+      LOG_ERROR("Initialisation failed: %d", camcorder_behaviour.init_result);
+      result = (int)camcorder_behaviour.init_result;
+      goto error;
+   }
+
+   if (sleepy_time != 0)
+   {
+      sleep(sleepy_time);
+      stop = 1;
+   }
+
+error:
+   LOG_TRACE("Waiting for camcorder thread to terminate");
+   vcos_thread_join(&camcorder_thread, NULL);
+
+   test_mmalcam_dump_stats("Render", &camcorder_behaviour.render_stats);
+   if (camcorder_behaviour.uri)
+      test_mmalcam_dump_stats("Encoder", &camcorder_behaviour.encoder_stats);
+
+   vcos_semaphore_delete(&camcorder_behaviour.init_sem);
+   return result;
+}
+
+
+/*****************************************************************************/
+static void *test_mmal_camcorder(void *id)
+{
+   MMALCAM_BEHAVIOUR_T *behaviour = (MMALCAM_BEHAVIOUR_T *)id;
+   int value;
+
+   value = test_mmal_start_camcorder(&stop, behaviour);
+
+   LOG_TRACE("Thread terminating, result %d", value);
+   return (void *)(uintptr_t)value;
+}
+
+/*****************************************************************************/
+static void test_signal_handler(int signum)
+{
+   (void)signum;
+
+   if (stopped_already)
+   {
+      LOG_ERROR("Killing program");
+      exit(255);
+   }
+   else
+   {
+      LOG_ERROR("Stopping normally. CTRL+C again to kill program");
+      stop = 1;
+      stopped_already = 1;
+   }
+}
+
+/*****************************************************************************/
+static void test_mmalcam_dump_stats(const char *title, MMAL_PARAMETER_STATISTICS_T* stats)
+{
+   printf("[%s]\n", title);
+   printf("buffer_count: %u\n", stats->buffer_count);
+   printf("frame_count: %u\n", stats->frame_count);
+   printf("frames_skipped: %u\n", stats->frames_skipped);
+   printf("frames_discarded: %u\n", stats->frames_discarded);
+   printf("eos_seen: %u\n", stats->eos_seen);
+   printf("maximum_frame_bytes: %u\n", stats->maximum_frame_bytes);
+   printf("total_bytes_hi: %u\n", (uint32_t)(stats->total_bytes >> 32));
+   printf("total_bytes_lo: %u\n", (uint32_t)(stats->total_bytes));
+   printf("corrupt_macroblocks: %u\n", stats->corrupt_macroblocks);
+}
+
+/*****************************************************************************/
+static MMAL_BOOL_T test_mmalcam_parse_rect(const char *str, MMAL_RECT_T *rect)
+{
+   /* coverity[secure_coding] Only reading integers, so can't overflow */
+   return sscanf(str, "%d,%d,%d,%d", &rect->x, &rect->y, &rect->width, &rect->height) == 4;
+}
+
+/*****************************************************************************/
+static int test_parse_cmdline(int argc, const char **argv)
+{
+   int i;
+   int passed_options = 0;
+
+   /* Parse the command line arguments */
+   for(i = 1; i < argc; i++)
+   {
+      if (!argv[i]) continue;
+
+      if (passed_options || argv[i][0] != '-')
+      {
+         /* Non-option argument */
+         continue;
+      }
+
+      /* We are now dealing with command line options */
+      switch(argv[i][1])
+      {
+      case '-': passed_options = 1; break;
+      case 'h': goto usage;
+      case 'o': if (i+1 >= argc) goto invalid_option;
+         camcorder_behaviour.uri = argv[++i];
+         break;
+      case 'v': if (i+1 >= argc) goto invalid_option;
+         camcorder_behaviour.vformat = argv[i+1];
+         break;
+      case 'r': if (i+1 >= argc) goto invalid_option;
+         if (!test_mmalcam_parse_rect(argv[i+1], &camcorder_behaviour.display_area)) goto invalid_option;
+         i++;
+         break;
+      case 'c': if (i+2 >= argc) goto invalid_option;
+         {
+            uint32_t table_index;
+
+            if (sscanf(argv[i+1], "%u", &camcorder_behaviour.seconds_per_change) != 1) goto invalid_option;
+
+            for (table_index = 0; table_index < countof(mmalcam_change_table); table_index++)
+               if (strcmp(mmalcam_change_table[table_index].name, argv[i+2]) == 0)
+                  break;
+            if (table_index >= countof(mmalcam_change_table)) goto invalid_option;
+
+            camcorder_behaviour.change = mmalcam_change_table[table_index].value;
+         }
+         break;
+      case 't': if (i+1 >= argc) goto invalid_option;
+         if (sscanf(argv[i+1], "%u", &sleepy_time) != 1) goto invalid_option;
+         i++;
+         break;
+      case 'f': if (i+1 >= argc) goto invalid_option;
+         camcorder_behaviour.frame_rate.den = 1;
+         if (sscanf(argv[i+1], "%u/%u", &camcorder_behaviour.frame_rate.num, &camcorder_behaviour.frame_rate.den) == 0) goto invalid_option;
+         i++;
+         break;
+      case 'x': camcorder_behaviour.tunneling = 1; break;
+      case 'z': camcorder_behaviour.zero_copy = (argv[i][2] != '!'); break;
+      case 'O': camcorder_behaviour.opaque = 1; break;
+      case 'b': if (i+1 >= argc) goto invalid_option;
+         if (sscanf(argv[i+1], "%u", &camcorder_behaviour.bit_rate) == 0) goto invalid_option;
+         i++;
+         break;
+      case 'a': if (i+1 >= argc) goto invalid_option;
+         if (sscanf(argv[i+1], "%u", &camcorder_behaviour.focus_test) == 0) goto invalid_option;
+         if (camcorder_behaviour.focus_test > MMAL_PARAM_FOCUS_EDOF) goto invalid_option;
+         i++;
+         break;
+      case 'n': if (i+1 >= argc) goto invalid_option;
+         if (sscanf(argv[i+1], "%u", &camcorder_behaviour.camera_num) == 0) goto invalid_option;
+         i++;
+         break;
+      default: goto invalid_option;
+      }
+      continue;
+   }
+
+   return 0;
+
+ invalid_option:
+   printf("invalid command line option (%s)\n", argv[i]);
+
+ usage:
+   {
+      const char *program;
+
+      program = strrchr(argv[0], '\\');
+      if (program)
+         program++;
+      else
+      {
+         program = strrchr(argv[0], '/');
+         if (program)
+            program++;
+         else
+            program = argv[0];
+      }
+      printf("usage: %s [options]\n", program);
+      printf("options list:\n");
+      printf(" -h          : help\n");
+      printf(" -o <file>   : write encoded output to <file>\n");
+      printf(" -v <format> : set video resolution and encoding format (defaults to '1280x720:h264')\n");
+      printf(" -r <r>      : put viewfinder at position <r>, given as x,y,width,height\n");
+      printf(" -c <n> <x>  : change camera parameter every <n> seconds.\n");
+      printf("                The parameter changed is defined by <x>, one of\n");
+      printf("                image_effect, rotation, zoom, focus, hdr, drc, contrast,\n");
+      printf("                brightness, saturation, sharpness\n");
+      printf(" -t <n>      : operate camera for <n> seconds\n");
+      printf(" -f <n>[/<d>]: set camera frame rate to <n>/<d>, where <d> is 1 if not given\n");
+      printf(" -x          : use tunneling\n");
+      printf(" -z          : use zero copy buffers (default)\n");
+      printf(" -z!         : use full copy buffers\n");
+      printf(" -O          : use opaque images\n");
+      printf(" -b <n>      : use <n> as the bitrate (bits/s)\n");
+      printf(" -a <n>      : Set to focus mode <n> (autofocus will cycle). Use MMAL_PARAM_FOCUS_T values.\n");
+      printf(" -n <n>      : Set camera number <n>. Use MMAL_PARAMETER_CAMERA_NUM values.\n");
+   }
+   return 1;
+}
